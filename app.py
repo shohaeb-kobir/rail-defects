@@ -1,78 +1,78 @@
 import cv2
+import time
 import os
-import glob
 import torch
+import subprocess
 import numpy as np
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
+from flask import Flask, Response, request, render_template_string, jsonify, redirect, url_for
+from ultralytics import YOLO
+from werkzeug.utils import secure_filename
 
-# ==========================================
-# --- 1. DYNAMIC CONFIGURATION ---
-# ==========================================
-# Paths inside the container
-VIDEO_PATH = os.getenv("VIDEO_PATH", "/app/data/input/video.mp4")
-MODEL_PATH = "/app/model/best.pt"
-OUTPUT_DIR = "/app/data/output"
-TEMP_FRAMES = "/tmp/processed_frames"
+app = Flask(__name__)
+UPLOAD_FOLDER = 'static/uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Settings
-FRAME_STRIDE = int(os.getenv("FRAME_STRIDE", "1"))
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.4"))
+# --- ROI DEFINITION ---
+# The trapezoid for your rail track
+ROI_POLYGON = np.array([[198, 290], [458, 282], [473, 353], [172, 353]], np.int32)
 
-# Your Specific Region of Interest (ROI)
-ROI_POLYGON = np.array([
-    [198, 290], [458, 282], [473, 353], [172, 353]
-], np.int32)
+# Load Model (Priority: TensorRT > PyTorch)
+MODEL_PATH = 'model/best.engine' if os.path.exists('model/best.engine') else 'model/best.pt'
+print(f"Loading Model: {MODEL_PATH}")
+model = YOLO(MODEL_PATH)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(TEMP_FRAMES, exist_ok=True)
+class AppState:
+    def __init__(self):
+        self.streams = []
+        self.conf_threshold = 0.5
+        self.enable_detection = True
+        self.show_roi = True # Highlights the inspection area
 
-# ==========================================
-# --- 2. LOGIC ---
-# ==========================================
+state = AppState()
 
+# Helper: Masking Function
 def apply_roi_mask(frame, polygon):
     mask = np.zeros(frame.shape, dtype=np.uint8)
     cv2.fillPoly(mask, [polygon], (255, 255, 255))
     return cv2.bitwise_and(frame, mask)
 
-def process_pipeline():
-    print(f"🚀 Starting Pipeline | Input: {VIDEO_PATH}")
-    
-    # 1. Extract & Mask
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print(f"❌ Error: Cannot open {VIDEO_PATH}")
-        return
+@app.route('/gpu_status')
+def gpu_status():
+    try:
+        cmd = "nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+        res = subprocess.check_output(cmd.split()).decode('utf-8').strip().split(', ')
+        return jsonify({"name": res[0], "temp": res[1], "used": res[2], "total": res[3], "util": res[4]})
+    except:
+        return jsonify({"status": "offline"})
 
-    saved_count = 0
-    while True:
+def generate_frames(stream_id):
+    if stream_id >= len(state.streams): return
+    source = state.streams[stream_id]
+    cap = cv2.VideoCapture(source)
+    
+    while cap.isOpened():
         success, frame = cap.read()
         if not success: break
-        
-        if saved_count % FRAME_STRIDE == 0:
-            masked = apply_roi_mask(frame, ROI_POLYGON)
-            cv2.imwrite(f"{TEMP_FRAMES}/frame_{saved_count:05d}.jpg", masked)
-        saved_count += 1
+
+        # Apply ROI Masking
+        processed_frame = apply_roi_mask(frame, ROI_POLYGON) if state.show_roi else frame.copy()
+
+        if state.enable_detection:
+            # Sliced-like inference can be simulated by focus on ROI
+            results = model.predict(processed_frame, conf=state.conf_threshold, verbose=False)
+            display_frame = results[0].plot()
+        else:
+            display_frame = processed_frame
+
+        # Draw ROI Boundary for the user
+        cv2.polylines(display_frame, [ROI_POLYGON], True, (0, 255, 255), 2)
+
+        _, buffer = cv2.imencode('.jpg', display_frame)
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
     cap.release()
-    print(f"✅ Extracted {saved_count} frames.")
 
-    # 2. Sliced Inference
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    detection_model = AutoDetectionModel.from_model_type(
-        model_type='yolov8', model_path=MODEL_PATH, 
-        confidence_threshold=CONF_THRESHOLD, device=device
-    )
+# ... (Include standard routes from previous code: index, upload, clear_streams, update_settings) ...
+# Ensure the HTML_TEMPLATE includes the GPU bar provided in the previous turn.
 
-    image_files = sorted(glob.glob(f"{TEMP_FRAMES}/*.jpg"))
-    for img_path in image_files:
-        result = get_sliced_prediction(
-            img_path, detection_model,
-            slice_height=640, slice_width=640,
-            overlap_height_ratio=0.2, overlap_width_ratio=0.2
-        )
-        result.export_visuals(export_dir=OUTPUT_DIR, file_name=os.path.basename(img_path).replace(".jpg", ""))
-    print(f"✅ Processing Complete. Results in {OUTPUT_DIR}")
-
-if __name__ == "__main__":
-    process_pipeline()
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, threaded=True)

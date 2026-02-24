@@ -1,6 +1,7 @@
 ultralytics
-sahi
+flask
 opencv-python-headless
 torch
 torchvision
 numpy
+werkzeug

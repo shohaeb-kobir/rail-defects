@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  rail-dashboard:
+    build: .
+    container_name: rail_ai_commander
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./static/uploads:/app/static/uploads
+      - ./model:/app/model
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
